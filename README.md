@@ -29,12 +29,13 @@ ctree src Cargo.toml
 ctree --files --sort complexity src
 ctree --functions src
 ctree --complexity-threshold 15 src
+ctree --format markdown --files --functions src
 ctree --format json --language rust,python .
 ctree --format csv --no-ignore .
 ctree --no-ast .
 ```
 
-`--no-ast` skips parsing, so node, depth, complexity, and syntax error fields are zero. `--hidden` includes hidden directory entries. `--no-ignore` disables gitignore filtering. Output formats are `table`, `json`, and `csv`.
+`--no-ast` skips parsing, so node, depth, complexity, and syntax error fields are zero. `--hidden` includes hidden directory entries. `--no-ignore` disables gitignore filtering. Output formats are `table`, `json`, `csv`, and `markdown` (`md` is an alias).
 
 `--functions` lists function-level cognitive complexity. `--complexity-threshold N` lists only functions whose score is greater than `N` and exits with status 1 if any exceed it, making it suitable for CI. JSON includes per-function metrics and a `complexity_violations` array; CSV includes function rows and filters them to violations when a threshold is set. Nested functions are scored independently and excluded from their parent's score.
 

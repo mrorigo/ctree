@@ -52,6 +52,8 @@ enum Format {
     Table,
     Json,
     Csv,
+    #[value(alias = "md")]
+    Markdown,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -83,6 +85,15 @@ fn main() -> Result<()> {
                 .context("could not serialize JSON output")?
         ),
         Format::Csv => render_csv(&reports, &summaries, cli.complexity_threshold),
+        Format::Markdown => render_markdown(
+            &reports,
+            &summaries,
+            cli.files,
+            cli.functions,
+            cli.complexity_threshold,
+            cli.sort,
+            started.elapsed(),
+        ),
         Format::Table => render_table(
             &reports,
             &summaries,
@@ -247,4 +258,116 @@ fn render_csv(
             );
         }
     }
+}
+
+fn render_markdown(
+    reports: &[ctree::FileReport],
+    summaries: &std::collections::BTreeMap<String, ctree::LangSummary>,
+    files: bool,
+    functions: bool,
+    complexity_threshold: Option<usize>,
+    sort: SortBy,
+    elapsed: std::time::Duration,
+) {
+    println!("# ctree report\n");
+    println!("Scanned in `{elapsed:.2?}`.\n");
+    println!("## Languages\n");
+    println!(
+        "| Language | Files | Code | Comments | Blanks | Nodes | Peak depth | Complexity | Syntax errors |"
+    );
+    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    let mut entries: Vec<_> = summaries.iter().collect();
+    entries.sort_by(|(name_a, a), (name_b, b)| match sort {
+        SortBy::Code => b.code.cmp(&a.code).then_with(|| name_a.cmp(name_b)),
+        SortBy::Files => b.files.cmp(&a.files).then_with(|| name_a.cmp(name_b)),
+        SortBy::Complexity => b
+            .complexity
+            .cmp(&a.complexity)
+            .then_with(|| name_a.cmp(name_b)),
+        SortBy::Nodes => b.nodes.cmp(&a.nodes).then_with(|| name_a.cmp(name_b)),
+        SortBy::Name => name_a.cmp(name_b),
+    });
+    let mut total = ctree::LangSummary::default();
+    for (language, summary) in entries {
+        println!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            markdown_cell(language),
+            summary.files,
+            summary.code,
+            summary.comments,
+            summary.blanks,
+            summary.nodes,
+            summary.peak_depth,
+            summary.complexity,
+            summary.syntax_errors
+        );
+        total.files += summary.files;
+        total.code += summary.code;
+        total.comments += summary.comments;
+        total.blanks += summary.blanks;
+        total.nodes += summary.nodes;
+        total.peak_depth = total.peak_depth.max(summary.peak_depth);
+        total.complexity += summary.complexity;
+        total.syntax_errors += summary.syntax_errors;
+    }
+    println!(
+        "| **Total** | {} | {} | {} | {} | {} | {} | {} | {} |",
+        total.files,
+        total.code,
+        total.comments,
+        total.blanks,
+        total.nodes,
+        total.peak_depth,
+        total.complexity,
+        total.syntax_errors
+    );
+
+    if files {
+        println!("\n## Files\n");
+        println!(
+            "| Path | Language | Code | Comments | Blanks | Nodes | Depth | Complexity | Syntax errors |"
+        );
+        println!("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+        for file in reports {
+            println!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                markdown_cell(&file.path.display().to_string()),
+                file.lang.display_name(),
+                file.lines.code,
+                file.lines.comments,
+                file.lines.blanks,
+                file.ast.total_nodes,
+                file.ast.max_depth,
+                file.ast.cognitive_complexity,
+                file.ast.syntax_errors
+            );
+        }
+    }
+
+    if functions || complexity_threshold.is_some() {
+        let title = complexity_threshold
+            .map(|limit| format!("## Functions over complexity {limit}"))
+            .unwrap_or_else(|| "## Functions".to_owned());
+        println!("\n{title}\n");
+        println!("| Path | Line | Function | Complexity |");
+        println!("| --- | ---: | --- | ---: |");
+        for file in reports {
+            for function in &file.functions {
+                if complexity_threshold.is_some_and(|limit| function.complexity <= limit) {
+                    continue;
+                }
+                println!(
+                    "| {} | {} | {} | {} |",
+                    markdown_cell(&file.path.display().to_string()),
+                    function.line,
+                    markdown_cell(&function.name),
+                    function.complexity
+                );
+            }
+        }
+    }
+}
+
+fn markdown_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace(['\n', '\r'], " ")
 }

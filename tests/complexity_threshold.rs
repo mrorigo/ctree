@@ -51,5 +51,19 @@ fn complexity_threshold_lists_violations_and_returns_failure_status() {
     let csv = String::from_utf8_lossy(&output.stdout);
     assert!(csv.contains("function,JavaScript"));
     assert!(csv.contains("\"nested\",1"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ctree"))
+        .arg("--format")
+        .arg("md")
+        .arg("--complexity-threshold")
+        .arg("2")
+        .arg(&path)
+        .output()
+        .expect("run ctree in Markdown mode");
+    assert_eq!(output.status.code(), Some(1));
+    let markdown = String::from_utf8_lossy(&output.stdout);
+    assert!(markdown.contains("# ctree report"));
+    assert!(markdown.contains("## Functions over complexity 2"));
+    assert!(markdown.contains("| nested | 4 |"));
     let _ = fs::remove_file(&path);
 }
