@@ -46,6 +46,19 @@ pub struct FileReport {
     pub lines: LineStats,
     /// Syntax tree metrics.
     pub ast: AstStats,
+    /// Per-function complexity metrics.
+    pub functions: Vec<FunctionReport>,
+}
+
+/// Complexity metrics for one function-like syntax scope.
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionReport {
+    /// Function name, or `<anonymous>` for closures and lambdas.
+    pub name: String,
+    /// One-based source line where the function begins.
+    pub line: usize,
+    /// Cognitive complexity contained by this function, excluding nested functions.
+    pub complexity: usize,
 }
 
 /// Aggregated metrics for one language.
@@ -149,8 +162,8 @@ fn process_file(path: &Path, lang: SupportedLanguage, no_ast: bool) -> Result<Fi
     let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let source = String::from_utf8_lossy(&bytes);
     let lines = calculate_line_metrics(&source, lang);
-    let ast = if no_ast {
-        AstStats::default()
+    let (ast, functions) = if no_ast {
+        (AstStats::default(), Vec::new())
     } else {
         let mut parser = Parser::new();
         parser
@@ -159,13 +172,17 @@ fn process_file(path: &Path, lang: SupportedLanguage, no_ast: bool) -> Result<Fi
         let tree = parser
             .parse(source.as_ref(), None)
             .ok_or_else(|| format!("{}: parser canceled", path.display()))?;
-        analyze_ast(&tree, lang)
+        (
+            analyze_ast(&tree, lang),
+            analyze_functions(&tree, lang, source.as_ref()),
+        )
     };
     Ok(FileReport {
         path: path.to_path_buf(),
         lang,
         lines,
         ast,
+        functions,
     })
 }
 
@@ -237,6 +254,83 @@ fn analyze_ast(tree: &tree_sitter::Tree, lang: SupportedLanguage) -> AstStats {
     }
 }
 
+fn analyze_functions(
+    tree: &tree_sitter::Tree,
+    lang: SupportedLanguage,
+    source: &str,
+) -> Vec<FunctionReport> {
+    let mut reports = Vec::new();
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        if lang.is_function_node(node) {
+            let name = node
+                .child_by_field_name("name")
+                .map(|name| {
+                    name.utf8_text(source.as_bytes())
+                        .unwrap_or("<anonymous>")
+                        .to_owned()
+                })
+                .unwrap_or_else(|| "<anonymous>".to_owned());
+            reports.push(FunctionReport {
+                name,
+                line: node.start_position().row + 1,
+                complexity: function_complexity(node, lang),
+            });
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return reports;
+            }
+        }
+    }
+}
+
+fn function_complexity(function: tree_sitter::Node<'_>, lang: SupportedLanguage) -> usize {
+    let mut complexity = 0;
+    let mut nesting = 0usize;
+    let mut cursor = function.walk();
+    loop {
+        let node = cursor.node();
+        let is_root = node.id() == function.id();
+        let is_nested_function = !is_root && lang.is_function_node(node);
+        if !is_root && !is_nested_function {
+            if lang.is_branching_node(node) {
+                complexity += 1 + nesting;
+            } else if lang.is_flat_jump_node(node) {
+                complexity += 1;
+            }
+            if lang.is_nesting_node(node) {
+                nesting += 1;
+            }
+        }
+        if !is_nested_function && cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return complexity;
+            }
+            let parent = cursor.node();
+            if parent.id() != function.id()
+                && !lang.is_function_node(parent)
+                && lang.is_nesting_node(parent)
+            {
+                nesting = nesting.saturating_sub(1);
+            }
+        }
+    }
+}
+
 /// Aggregates file reports by language.
 pub fn summarize(reports: &[FileReport]) -> BTreeMap<String, LangSummary> {
     let mut summaries = BTreeMap::new();
@@ -260,8 +354,32 @@ pub fn summarize(reports: &[FileReport]) -> BTreeMap<String, LangSummary> {
 pub fn json_output(
     reports: &[FileReport],
     summaries: &BTreeMap<String, LangSummary>,
+    complexity_threshold: Option<usize>,
 ) -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(&serde_json::json!({"files": reports, "languages": summaries}))
+    let violations: Vec<_> = reports
+        .iter()
+        .flat_map(|file| {
+            file.functions
+                .iter()
+                .filter(move |function| {
+                    complexity_threshold.is_some_and(|threshold| function.complexity > threshold)
+                })
+                .map(move |function| {
+                    serde_json::json!({
+                        "path": file.path,
+                        "name": function.name,
+                        "line": function.line,
+                        "complexity": function.complexity,
+                    })
+                })
+        })
+        .collect();
+    serde_json::to_string_pretty(&serde_json::json!({
+        "files": reports,
+        "languages": summaries,
+        "complexity_threshold": complexity_threshold,
+        "complexity_violations": violations,
+    }))
 }
 
 #[cfg(test)]
@@ -381,6 +499,27 @@ mod tests {
                 language.display_name()
             );
         }
+    }
+
+    #[test]
+    fn reports_function_complexity_without_charging_nested_functions_to_parent() {
+        let source =
+            "function outer(x) { if (x) { function inner(y) { if (y) return; } return; } }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&SupportedLanguage::JavaScript.tree_sitter_language())
+            .expect("JavaScript grammar should load");
+        let tree = parser
+            .parse(source, None)
+            .expect("parser should return a tree");
+        let functions = analyze_functions(&tree, SupportedLanguage::JavaScript, source);
+
+        assert_eq!(functions.len(), 2);
+        assert_eq!(functions[0].name, "outer");
+        assert_eq!(functions[0].line, 1);
+        assert_eq!(functions[0].complexity, 2);
+        assert_eq!(functions[1].name, "inner");
+        assert_eq!(functions[1].complexity, 2);
     }
 
     #[test]

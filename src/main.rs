@@ -24,6 +24,12 @@ struct Cli {
     /// Include a row for each source file.
     #[arg(long)]
     files: bool,
+    /// Include complexity metrics for each function-like scope.
+    #[arg(long, conflicts_with = "no_ast")]
+    functions: bool,
+    /// Fail with status 1 if any function complexity is greater than this value.
+    #[arg(long, value_name = "N", conflicts_with = "no_ast")]
+    complexity_threshold: Option<usize>,
     /// Include hidden files and directories.
     #[arg(long)]
     hidden: bool,
@@ -73,13 +79,30 @@ fn main() -> Result<()> {
     match cli.format {
         Format::Json => println!(
             "{}",
-            json_output(&reports, &summaries).context("could not serialize JSON output")?
+            json_output(&reports, &summaries, cli.complexity_threshold)
+                .context("could not serialize JSON output")?
         ),
-        Format::Csv => render_csv(&reports, &summaries),
-        Format::Table => render_table(&reports, &summaries, cli.files, cli.sort, started.elapsed()),
+        Format::Csv => render_csv(&reports, &summaries, cli.complexity_threshold),
+        Format::Table => render_table(
+            &reports,
+            &summaries,
+            cli.files,
+            cli.functions,
+            cli.complexity_threshold,
+            cli.sort,
+            started.elapsed(),
+        ),
     }
     for error in &errors {
         eprintln!("ctree: {error}");
+    }
+    if cli.complexity_threshold.is_some_and(|threshold| {
+        reports
+            .iter()
+            .flat_map(|file| &file.functions)
+            .any(|function| function.complexity > threshold)
+    }) {
+        std::process::exit(1);
     }
     if reports.is_empty() && !errors.is_empty() {
         std::process::exit(2);
@@ -91,6 +114,8 @@ fn render_table(
     reports: &[ctree::FileReport],
     summaries: &std::collections::BTreeMap<String, ctree::LangSummary>,
     files: bool,
+    functions: bool,
+    complexity_threshold: Option<usize>,
     sort: SortBy,
     elapsed: std::time::Duration,
 ) {
@@ -144,6 +169,26 @@ fn render_table(
             );
         }
     }
+    if functions || complexity_threshold.is_some() {
+        let title = complexity_threshold
+            .map(|limit| format!("FUNCTIONS (complexity > {limit})"))
+            .unwrap_or_else(|| "FUNCTIONS".to_owned());
+        println!("\n{title}");
+        for file in reports {
+            for function in &file.functions {
+                if complexity_threshold.is_some_and(|limit| function.complexity <= limit) {
+                    continue;
+                }
+                println!(
+                    "{}:{}\t{}\tcomplexity {}",
+                    file.path.display(),
+                    function.line,
+                    function.name,
+                    function.complexity
+                );
+            }
+        }
+    }
 }
 
 fn print_summary(name: &str, s: &ctree::LangSummary) {
@@ -156,13 +201,14 @@ fn print_summary(name: &str, s: &ctree::LangSummary) {
 fn render_csv(
     reports: &[ctree::FileReport],
     summaries: &std::collections::BTreeMap<String, ctree::LangSummary>,
+    complexity_threshold: Option<usize>,
 ) {
     println!(
-        "record,language,path,files,code,comments,blanks,nodes,depth,complexity,syntax_errors"
+        "record,language,path,files,code,comments,blanks,nodes,depth,complexity,syntax_errors,function,line"
     );
     for (language, s) in summaries {
         println!(
-            "summary,{language},,{},{},{},{},{},{},{},{}",
+            "summary,{language},,{},{},{},{},{},{},{},{},,",
             s.files,
             s.code,
             s.comments,
@@ -176,7 +222,7 @@ fn render_csv(
     for file in reports {
         let path = file.path.to_string_lossy().replace('"', "\"\"");
         println!(
-            "file,{},\"{}\",1,{},{},{},{},{},{},{}",
+            "file,{},\"{}\",1,{},{},{},{},{},{},{},,",
             file.lang.display_name(),
             path,
             file.lines.code,
@@ -187,5 +233,18 @@ fn render_csv(
             file.ast.cognitive_complexity,
             file.ast.syntax_errors
         );
+        for function in &file.functions {
+            if complexity_threshold.is_some_and(|limit| function.complexity <= limit) {
+                continue;
+            }
+            println!(
+                "function,{},\"{}\",,,,,,,{},\"{}\",{}",
+                file.lang.display_name(),
+                path,
+                function.complexity,
+                function.name.replace('"', "\"\""),
+                function.line
+            );
+        }
     }
 }

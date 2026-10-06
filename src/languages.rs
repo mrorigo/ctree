@@ -59,6 +59,24 @@ impl SupportedLanguage {
         }
     }
 
+    /// Reports whether a syntax node begins a function-like scope.
+    pub fn is_function_node(self, node: Node<'_>) -> bool {
+        match self {
+            Self::Rust => matches!(node.kind(), "function_item" | "closure_expression"),
+            Self::Python => matches!(
+                node.kind(),
+                "function_definition" | "async_function_definition" | "lambda"
+            ),
+            Self::TypeScript | Self::Tsx | Self::JavaScript | Self::Jsx => matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "method_definition"
+            ),
+        }
+    }
+
     /// Reports whether this node adds a level to cognitive nesting.
     pub fn is_nesting_node(self, node: Node<'_>) -> bool {
         let kind = node.kind();
