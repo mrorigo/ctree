@@ -210,12 +210,13 @@ fn analyze_ast(tree: &tree_sitter::Tree, lang: SupportedLanguage) -> AstStats {
         if node.is_error() || node.is_missing() {
             stats.syntax_errors += 1;
         }
-        if lang.is_nesting_node(node) {
-            nesting += 1;
-        } else if lang.is_branching_node(node) {
+        if lang.is_branching_node(node) {
             stats.cognitive_complexity += 1 + nesting;
         } else if lang.is_flat_jump_node(node) {
             stats.cognitive_complexity += 1;
+        }
+        if lang.is_nesting_node(node) {
+            nesting += 1;
         }
         if cursor.goto_first_child() {
             depth += 1;
@@ -261,4 +262,130 @@ pub fn json_output(
     summaries: &BTreeMap<String, LangSummary>,
 ) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&serde_json::json!({"files": reports, "languages": summaries}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn analyze(source: &str, language: SupportedLanguage) -> AstStats {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&language.tree_sitter_language())
+            .expect("supported grammar should load");
+        let tree = parser
+            .parse(source, None)
+            .expect("parser should return a tree");
+        analyze_ast(&tree, language)
+    }
+
+    #[test]
+    fn detects_supported_extensions_case_insensitively() {
+        assert_eq!(
+            SupportedLanguage::from_extension("RS"),
+            Some(SupportedLanguage::Rust)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("pyi"),
+            Some(SupportedLanguage::Python)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("tsx"),
+            Some(SupportedLanguage::Tsx)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("jsx"),
+            Some(SupportedLanguage::Jsx)
+        );
+        assert_eq!(SupportedLanguage::from_extension("unknown"), None);
+    }
+
+    #[test]
+    fn counts_blank_code_line_and_comment_categories() {
+        let source =
+            "// leading comment\n\nfn f() {} // trailing comment\n/* block\n * continuation\n */\n";
+        let stats = calculate_line_metrics(source, SupportedLanguage::Rust);
+        assert_eq!(stats.comments, 4);
+        assert_eq!(stats.blanks, 1);
+        assert_eq!(stats.code, 1);
+    }
+
+    #[test]
+    fn counts_python_hash_comments() {
+        let stats = calculate_line_metrics("# comment\nx = 1\n", SupportedLanguage::Python);
+        assert_eq!(stats.comments, 1);
+        assert_eq!(stats.code, 1);
+        assert_eq!(stats.blanks, 0);
+    }
+
+    #[test]
+    fn all_supported_grammars_parse_representative_sources() {
+        let examples = [
+            (SupportedLanguage::Rust, "fn main() { let value = 1; }"),
+            (SupportedLanguage::Python, "def main():\n    value = 1\n"),
+            (SupportedLanguage::TypeScript, "const value: number = 1;"),
+            (SupportedLanguage::Tsx, "const view = <div />;"),
+            (SupportedLanguage::JavaScript, "const value = 1;"),
+            (SupportedLanguage::Jsx, "const view = <div />;"),
+        ];
+
+        for (language, source) in examples {
+            let stats = analyze(source, language);
+            assert!(
+                stats.total_nodes > 0,
+                "{} should produce named nodes",
+                language.display_name()
+            );
+            assert_eq!(
+                stats.syntax_errors,
+                0,
+                "{} example should parse cleanly",
+                language.display_name()
+            );
+        }
+    }
+
+    #[test]
+    fn cognitive_complexity_counts_nesting_branches_and_flat_jumps() {
+        let examples = [
+            (
+                SupportedLanguage::Rust,
+                "fn f(x: bool) { if x { return; } }",
+            ),
+            (
+                SupportedLanguage::Python,
+                "def f(x):\n    if x:\n        return\n",
+            ),
+            (
+                SupportedLanguage::TypeScript,
+                "function f(x: boolean) { if (x) return; }",
+            ),
+            (
+                SupportedLanguage::JavaScript,
+                "function f(x) { if (x) return; }",
+            ),
+        ];
+
+        for (language, source) in examples {
+            let stats = analyze(source, language);
+            assert_eq!(
+                stats.syntax_errors,
+                0,
+                "{} example should parse cleanly",
+                language.display_name()
+            );
+            assert_eq!(
+                stats.cognitive_complexity,
+                3,
+                "{} branch should be nested in its function and include return",
+                language.display_name()
+            );
+        }
+    }
+
+    #[test]
+    fn reports_recoverable_syntax_errors() {
+        let stats = analyze("fn broken( {", SupportedLanguage::Rust);
+        assert!(stats.syntax_errors > 0);
+    }
 }
