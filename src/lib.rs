@@ -1,0 +1,264 @@
+// Rust guideline compliant 2026-10-06
+//! Syntax-aware source code metrics for supported programming languages.
+
+pub mod languages;
+
+use languages::SupportedLanguage;
+use rayon::prelude::*;
+use serde::Serialize;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use tree_sitter::Parser;
+
+/// Counts source lines by their primary content category.
+#[derive(Default, Debug, Clone, Serialize)]
+pub struct LineStats {
+    /// Lines containing code, including mixed code and comment lines.
+    pub code: usize,
+    /// Lines containing comments only.
+    pub comments: usize,
+    /// Empty or whitespace-only lines.
+    pub blanks: usize,
+}
+
+/// Summarizes syntax tree size, depth, and cognitive complexity.
+#[derive(Default, Debug, Clone, Serialize)]
+pub struct AstStats {
+    /// Number of named syntax tree nodes.
+    pub total_nodes: usize,
+    /// Maximum syntax tree depth, with the root at depth zero.
+    pub max_depth: usize,
+    /// Cognitive complexity using language-specific branch and nesting rules.
+    pub cognitive_complexity: usize,
+    /// Number of syntax errors and missing nodes reported by the parser.
+    pub syntax_errors: usize,
+}
+
+/// Metrics collected for one source file.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileReport {
+    /// Path of the analyzed file.
+    pub path: PathBuf,
+    /// Detected source language.
+    pub lang: SupportedLanguage,
+    /// Source line metrics.
+    pub lines: LineStats,
+    /// Syntax tree metrics.
+    pub ast: AstStats,
+}
+
+/// Aggregated metrics for one language.
+#[derive(Default, Debug, Clone, Serialize)]
+pub struct LangSummary {
+    /// Number of successfully parsed files.
+    pub files: usize,
+    /// Number of code lines.
+    pub code: usize,
+    /// Number of comment-only lines.
+    pub comments: usize,
+    /// Number of blank lines.
+    pub blanks: usize,
+    /// Number of named syntax nodes.
+    pub nodes: usize,
+    /// Maximum syntax tree depth among files.
+    pub peak_depth: usize,
+    /// Total cognitive complexity.
+    pub complexity: usize,
+    /// Syntax errors and missing nodes across files.
+    pub syntax_errors: usize,
+}
+
+/// Options that control a source tree scan.
+#[derive(Debug, Clone)]
+pub struct ScanOptions {
+    /// Root directories or files to scan.
+    pub paths: Vec<PathBuf>,
+    /// Include hidden files and directories.
+    pub hidden: bool,
+    /// Include files ignored by gitignore rules.
+    pub no_ignore: bool,
+    /// Include individual source file rows in output.
+    pub files: bool,
+    /// Skip syntax parsing, while retaining line metrics.
+    pub no_ast: bool,
+    /// Optional set of language display names to include.
+    pub languages: Vec<String>,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            paths: vec![PathBuf::from(".")],
+            hidden: false,
+            no_ignore: false,
+            files: false,
+            no_ast: false,
+            languages: Vec::new(),
+        }
+    }
+}
+
+/// Scans paths and returns file-level metrics and any read/parse setup errors.
+pub fn scan(options: &ScanOptions) -> (Vec<FileReport>, Vec<String>) {
+    let mut builder = ignore::WalkBuilder::new(&options.paths[0]);
+    for path in options.paths.iter().skip(1) {
+        builder.add(path);
+    }
+    builder
+        .hidden(!options.hidden)
+        .git_ignore(!options.no_ignore)
+        .git_global(!options.no_ignore)
+        .git_exclude(!options.no_ignore);
+    let candidates: Vec<(PathBuf, SupportedLanguage)> = builder
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let language = entry
+                .path()
+                .extension()?
+                .to_str()
+                .and_then(SupportedLanguage::from_extension)?;
+            let allowed = options.languages.is_empty()
+                || options
+                    .languages
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(language.display_name()));
+            allowed.then(|| (entry.into_path(), language))
+        })
+        .collect();
+    let processed: Vec<Result<FileReport, String>> = candidates
+        .par_iter()
+        .map(|(path, language)| process_file(path, *language, options.no_ast))
+        .collect();
+    let mut reports = Vec::new();
+    let mut errors = Vec::new();
+    for item in processed {
+        match item {
+            Ok(report) => reports.push(report),
+            Err(error) => errors.push(error),
+        }
+    }
+    reports.sort_by(|left, right| left.path.cmp(&right.path));
+    errors.sort();
+    (reports, errors)
+}
+
+fn process_file(path: &Path, lang: SupportedLanguage, no_ast: bool) -> Result<FileReport, String> {
+    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let source = String::from_utf8_lossy(&bytes);
+    let lines = calculate_line_metrics(&source, lang);
+    let ast = if no_ast {
+        AstStats::default()
+    } else {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&lang.tree_sitter_language())
+            .map_err(|error| format!("{}: parser setup failed: {error}", path.display()))?;
+        let tree = parser
+            .parse(source.as_ref(), None)
+            .ok_or_else(|| format!("{}: parser canceled", path.display()))?;
+        analyze_ast(&tree, lang)
+    };
+    Ok(FileReport {
+        path: path.to_path_buf(),
+        lang,
+        lines,
+        ast,
+    })
+}
+
+fn calculate_line_metrics(source: &str, lang: SupportedLanguage) -> LineStats {
+    let mut stats = LineStats::default();
+    let mut block_comment = false;
+    for raw in source.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            stats.blanks += 1;
+            continue;
+        }
+        let hash_comment = lang == SupportedLanguage::Python && line.starts_with('#');
+        if block_comment {
+            stats.comments += 1;
+            if line.contains("*/") {
+                block_comment = false;
+            }
+        } else if hash_comment || line.starts_with("//") || line.starts_with("#!") {
+            stats.comments += 1;
+        } else if line.starts_with("/*") {
+            stats.comments += 1;
+            block_comment = !line.contains("*/");
+        } else {
+            stats.code += 1;
+        }
+    }
+    stats
+}
+
+fn analyze_ast(tree: &tree_sitter::Tree, lang: SupportedLanguage) -> AstStats {
+    let mut stats = AstStats::default();
+    let mut cursor = tree.walk();
+    let mut depth = 0usize;
+    let mut nesting = 0usize;
+    loop {
+        let node = cursor.node();
+        if node.is_named() {
+            stats.total_nodes += 1;
+        }
+        stats.max_depth = stats.max_depth.max(depth);
+        if node.is_error() || node.is_missing() {
+            stats.syntax_errors += 1;
+        }
+        if lang.is_nesting_node(node) {
+            nesting += 1;
+        } else if lang.is_branching_node(node) {
+            stats.cognitive_complexity += 1 + nesting;
+        } else if lang.is_flat_jump_node(node) {
+            stats.cognitive_complexity += 1;
+        }
+        if cursor.goto_first_child() {
+            depth += 1;
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return stats;
+            }
+            depth = depth.saturating_sub(1);
+            if lang.is_nesting_node(cursor.node()) {
+                nesting = nesting.saturating_sub(1);
+            }
+        }
+    }
+}
+
+/// Aggregates file reports by language.
+pub fn summarize(reports: &[FileReport]) -> BTreeMap<String, LangSummary> {
+    let mut summaries = BTreeMap::new();
+    for report in reports {
+        let summary: &mut LangSummary = summaries
+            .entry(report.lang.display_name().to_owned())
+            .or_default();
+        summary.files += 1;
+        summary.code += report.lines.code;
+        summary.comments += report.lines.comments;
+        summary.blanks += report.lines.blanks;
+        summary.nodes += report.ast.total_nodes;
+        summary.peak_depth = summary.peak_depth.max(report.ast.max_depth);
+        summary.complexity += report.ast.cognitive_complexity;
+        summary.syntax_errors += report.ast.syntax_errors;
+    }
+    summaries
+}
+
+/// Renders scan results as a JSON document.
+pub fn json_output(
+    reports: &[FileReport],
+    summaries: &BTreeMap<String, LangSummary>,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(&serde_json::json!({"files": reports, "languages": summaries}))
+}
